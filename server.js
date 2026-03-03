@@ -9,6 +9,11 @@ const VERIFY_TOKEN = process.env.VERIFY_TOKEN || 'xcirculars_webhook_verify_2026
 const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
 const PORT = process.env.PORT || 3000;
 
+// Configuración de escalamiento a humano
+const HUMAN_AGENT_NUMBER = '+12018323326'; // Johm
+const ESCALATION_KEYWORDS = ['persona', 'humano', 'agente', 'representante', 'supervisor', 'jefe', 'encargado'];
+const MAX_RETRY_ATTEMPTS = 2;
+
 // Verificación de firma de Meta (seguridad)
 function verifyRequestSignature(req, res, buf) {
   const signature = req.headers['x-hub-signature-256'];
@@ -156,13 +161,12 @@ async function handleIncomingMessage(message, value) {
 // ============================================
 // LÓGICA DE PROCESAMIENTO (xcirculars)
 // ============================================
-async function processXcircularsMessage(data) {
-  const { from, name, type, content, timestamp } = data;
 
-  // TODO: Implementar lógica de negocio
-  // 1. Buscar cliente en Airtable por número de teléfono
-  // 2. Identificar intención (pregunta sobre circular, soporte, etc.)
-  // 3. Responder automáticamente o escalar a humano
+// Almacenamiento temporal de conversaciones (en producción usar Redis/DB)
+const conversations = new Map();
+
+async function processXcircularsMessage(data) {
+  const { from, name, type, content, timestamp, messageId } = data;
 
   console.log('🤖 Procesando para xcirculars:', {
     cliente: name,
@@ -170,31 +174,129 @@ async function processXcircularsMessage(data) {
     mensaje: content.substring(0, 100)
   });
 
-  // Respuesta automática de ejemplo (para testing)
   const lowerContent = content.toLowerCase();
   
-  if (lowerContent.includes('hola') || lowerContent.includes('buenos')) {
+  // Inicializar o obtener conversación
+  if (!conversations.has(from)) {
+    conversations.set(from, {
+      name,
+      messages: [],
+      retryCount: 0,
+      escalated: false,
+      lastInteraction: Date.now()
+    });
+  }
+  const conversation = conversations.get(from);
+  conversation.messages.push({ role: 'user', content, timestamp });
+
+  // 1. DETECTAR PALABRAS CLAVE DE ESCALAMIENTO
+  const wantsHuman = ESCALATION_KEYWORDS.some(keyword => lowerContent.includes(keyword));
+  
+  if (wantsHuman) {
+    await escalateToHuman(from, name, conversation, 'Cliente solicitó hablar con persona');
+    return;
+  }
+
+  // 2. RESPUESTAS AUTOMÁTICAS
+  if (lowerContent.includes('hola') || lowerContent.includes('buenos') || lowerContent.includes('buenas')) {
+    conversation.retryCount = 0; // Reset contador
     await sendWhatsAppMessage(from, 
       `¡Hola ${name}! 👋\n\n` +
-      `Soy Iris, asistente de xcirculars.\n\n` +
-      `¿En qué puedo ayudarte hoy?\n` +
-      `• Estado de tu circular\n` +
-      `• Soporte técnico\n` +
-      `• Información general`
+      `Soy Iris, asistente virtual de xcirculars.\n\n` +
+      `Puedo ayudarte con:\n` +
+      `• 📋 Estado de tu circular\n` +
+      `• 🛠️ Soporte técnico\n` +
+      `• ℹ️ Información general\n\n` +
+      `Si necesitas hablar con una persona, escribe "persona".`
     );
-  } else if (lowerContent.includes('estado') || lowerContent.includes('circular')) {
+    return;
+  }
+  
+  if (lowerContent.includes('estado') || lowerContent.includes('circular') || lowerContent.includes('orden')) {
+    conversation.retryCount = 0;
     await sendWhatsAppMessage(from,
-      `Para consultar el estado de tu circular, necesito tu nombre de tienda o correo registrado. 📋\n\n` +
-      `¿Cuál es el nombre de tu supermercado?`
+      `Para consultar el estado de tu circular, necesito tu información. 📋\n\n` +
+      `¿Cuál es el nombre de tu supermercado o tu correo registrado?`
     );
-  } else if (lowerContent.includes('soporte') || lowerContent.includes('ayuda')) {
+    return;
+  }
+  
+  if (lowerContent.includes('soporte') || lowerContent.includes('ayuda') || lowerContent.includes('problema')) {
+    conversation.retryCount = 0;
     await sendWhatsAppMessage(from,
       `🛠️ Soporte Técnico\n\n` +
-      `Describe tu problema y te conectaré con un agente humano.\n\n` +
-      `Horario de atención: Lunes a Viernes 9:00 AM - 6:00 PM EST`
+      `Describe tu problema con detalle y te ayudaré. Si es necesario, conectaré con un agente humano.\n\n` +
+      `¿Qué problema estás experimentando?`
+    );
+    return;
+  }
+
+  // 3. MANEJAR INFORMACIÓN DE CLIENTE (nombre de tienda/correo)
+  // Si el cliente responde después de pedir estado, asumimos que da su info
+  const lastBotMessage = conversation.messages.slice().reverse().find(m => m.role === 'bot');
+  if (lastBotMessage?.content.includes('nombre de tu supermercado')) {
+    // Aquí conectaríamos con Airtable para buscar el cliente
+    conversation.retryCount = 0;
+    await sendWhatsAppMessage(from,
+      `Gracias ${name}. 🔍\n\n` +
+      `Estoy buscando tu información en nuestro sistema...\n\n` +
+      `(Próximamente: integración con Airtable para mostrar estado real)`
+    );
+    return;
+  }
+
+  // 4. NO ENTENDÍ → INCREMENTAR CONTADOR Y REINTENTAR
+  conversation.retryCount++;
+  
+  if (conversation.retryCount >= MAX_RETRY_ATTEMPTS) {
+    // Máximo de intentos alcanzado → Escalar
+    await escalateToHuman(from, name, conversation, `No entendí después de ${MAX_RETRY_ATTEMPTS} intentos`);
+  } else {
+    // Reintentar con opciones claras
+    await sendWhatsAppMessage(from,
+      `No estoy segura de entender. 🤔\n\n` +
+      `¿Puedes elegir una opción?\n` +
+      `• Escribe "estado" para ver tu circular\n` +
+      `• Escribe "soporte" para ayuda técnica\n` +
+      `• Escribe "persona" para hablar con alguien`
     );
   }
-  // Si no reconoce la intención, no responde (escalar a humano)
+}
+
+// ============================================
+// ESCALAR A AGENTE HUMANO
+// ============================================
+async function escalateToHuman(customerPhone, customerName, conversation, reason) {
+  conversation.escalated = true;
+  
+  console.log(`🚨 ESCALANDO a humano: ${customerName} (${customerPhone}) - ${reason}`);
+
+  // Notificar al cliente
+  await sendWhatsAppMessage(customerPhone,
+    `Entendido ${customerName}. 👤\n\n` +
+    `Te estoy conectando con un agente humano. Por favor espera un momento...\n\n` +
+    `⏱️ Tiempo estimado: 2-5 minutos`
+  );
+
+  // Notificar a Johm (agente humano)
+  const conversationHistory = conversation.messages
+    .map(m => `${m.role === 'user' ? '👤 Cliente' : '🤖 Bot'}: ${m.content}`)
+    .join('\n');
+
+  const notificationMessage = 
+    `🚨 *NUEVO CASO ESCALADO*\n\n` +
+    `*Cliente:* ${customerName}\n` +
+    `*Teléfono:* ${customerPhone}\n` +
+    `*Razón:* ${reason}\n` +
+    `*Hora:* ${new Date().toLocaleString('es-US', { timeZone: 'America/New_York' })} EST\n\n` +
+    `*Historial de conversación:*\n` +
+    `${conversationHistory}\n\n` +
+    `Para responder, escribe:\n` +
+    `\`/responder ${customerPhone} Tu mensaje aquí\``;
+
+  await sendWhatsAppMessage(HUMAN_AGENT_NUMBER, notificationMessage);
+  
+  console.log(`✅ Notificación enviada a ${HUMAN_AGENT_NUMBER}`);
 }
 
 // ============================================
@@ -253,6 +355,37 @@ function handleMessageStatus(status) {
     console.log('   Error:', status.errors);
   }
 }
+
+// ============================================
+// ENDPOINT PARA AGENTE HUMANO RESPONDER
+// ============================================
+app.post('/respond', async (req, res) => {
+  const { to, message, agentName = 'Agente' } = req.body;
+  
+  if (!to || !message) {
+    return res.status(400).json({ error: 'Faltan campos: to, message' });
+  }
+
+  console.log(`👤 ${agentName} respondiendo a ${to}: "${message.substring(0, 50)}..."`);
+
+  // Enviar mensaje al cliente
+  await sendWhatsAppMessage(to, 
+    `👤 *${agentName}:*\n\n${message}\n\n` +
+    `¿Hay algo más en lo que pueda ayudarte?`
+  );
+
+  // Actualizar conversación
+  if (conversations.has(to)) {
+    conversations.get(to).messages.push({ 
+      role: 'agent', 
+      content: message, 
+      agent: agentName,
+      timestamp: Date.now() 
+    });
+  }
+
+  res.json({ success: true, message: 'Respuesta enviada' });
+});
 
 // ============================================
 // ENDPOINTS DE SALUD
