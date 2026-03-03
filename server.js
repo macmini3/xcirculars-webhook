@@ -187,11 +187,13 @@ async function processXcircularsMessage(data) {
     return;
   }
   
-  // 3. SOPORTE
+  // 3. SOPORTE - DAR NÚMERO DE JOHM DIRECTAMENTE
   if (lowerContent.includes('soporte') || lowerContent.includes('ayuda') || lowerContent.includes('problema')) {
     await sendWhatsAppMessage(from,
       `🛠️ Soporte Técnico\n\n` +
-      `Describe tu problema. Si necesitas hablar con alguien, escribe "persona".`
+      `Para ayuda directa, contacta a Johm:\n\n` +
+      `📞 ${JOHM_NUMBER}\n\n` +
+      `Escríbele por WhatsApp.`
     );
     return;
   }
