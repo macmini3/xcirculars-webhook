@@ -9,10 +9,8 @@ const VERIFY_TOKEN = process.env.VERIFY_TOKEN || 'xcirculars_webhook_verify_2026
 const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
 const PORT = process.env.PORT || 3000;
 
-// Configuración de escalamiento a humano
-const HUMAN_AGENT_NUMBER = '+12018323326'; // Johm
-const ESCALATION_KEYWORDS = ['persona', 'humano', 'agente', 'representante', 'supervisor', 'jefe', 'encargado'];
-const MAX_RETRY_ATTEMPTS = 2;
+// Número de Johm para soporte humano
+const JOHM_NUMBER = '+12018323326';
 
 // Verificación de firma de Meta (seguridad)
 function verifyRequestSignature(req, res, buf) {
@@ -161,142 +159,63 @@ async function handleIncomingMessage(message, value) {
 // ============================================
 // LÓGICA DE PROCESAMIENTO (xcirculars)
 // ============================================
-
-// Almacenamiento temporal de conversaciones (en producción usar Redis/DB)
-const conversations = new Map();
-
 async function processXcircularsMessage(data) {
-  const { from, name, type, content, timestamp, messageId } = data;
-
-  console.log('🤖 Procesando para xcirculars:', {
-    cliente: name,
-    telefono: from,
-    mensaje: content.substring(0, 100)
-  });
-
+  const { from, name, type, content } = data;
   const lowerContent = content.toLowerCase();
-  
-  // Inicializar o obtener conversación
-  if (!conversations.has(from)) {
-    conversations.set(from, {
-      name,
-      messages: [],
-      retryCount: 0,
-      escalated: false,
-      lastInteraction: Date.now()
-    });
-  }
-  const conversation = conversations.get(from);
-  conversation.messages.push({ role: 'user', content, timestamp });
 
-  // 1. DETECTAR PALABRAS CLAVE DE ESCALAMIENTO
-  const wantsHuman = ESCALATION_KEYWORDS.some(keyword => lowerContent.includes(keyword));
-  
-  if (wantsHuman) {
-    await escalateToHuman(from, name, conversation, 'Cliente solicitó hablar con persona');
-    return;
-  }
+  console.log('🤖 Procesando:', { cliente: name, mensaje: content.substring(0, 50) });
 
-  // 2. RESPUESTAS AUTOMÁTICAS
+  // 1. SALUDO
   if (lowerContent.includes('hola') || lowerContent.includes('buenos') || lowerContent.includes('buenas')) {
-    conversation.retryCount = 0; // Reset contador
     await sendWhatsAppMessage(from, 
       `¡Hola ${name}! 👋\n\n` +
-      `Soy Iris, asistente virtual de xcirculars.\n\n` +
-      `Puedo ayudarte con:\n` +
-      `• 📋 Estado de tu circular\n` +
-      `• 🛠️ Soporte técnico\n` +
-      `• ℹ️ Información general\n\n` +
-      `Si necesitas hablar con una persona, escribe "persona".`
+      `Soy Iris, asistente de xcirculars.\n\n` +
+      `¿En qué puedo ayudarte?\n` +
+      `• Estado de tu circular\n` +
+      `• Soporte técnico\n` +
+      `• Información general`
     );
     return;
   }
   
+  // 2. ESTADO DE CIRCULAR
   if (lowerContent.includes('estado') || lowerContent.includes('circular') || lowerContent.includes('orden')) {
-    conversation.retryCount = 0;
     await sendWhatsAppMessage(from,
-      `Para consultar el estado de tu circular, necesito tu información. 📋\n\n` +
-      `¿Cuál es el nombre de tu supermercado o tu correo registrado?`
+      `Para consultar tu circular, necesito tu nombre de tienda o correo. 📋\n\n` +
+      `¿Cuál es el nombre de tu supermercado?`
     );
     return;
   }
   
+  // 3. SOPORTE
   if (lowerContent.includes('soporte') || lowerContent.includes('ayuda') || lowerContent.includes('problema')) {
-    conversation.retryCount = 0;
     await sendWhatsAppMessage(from,
       `🛠️ Soporte Técnico\n\n` +
-      `Describe tu problema con detalle y te ayudaré. Si es necesario, conectaré con un agente humano.\n\n` +
-      `¿Qué problema estás experimentando?`
+      `Describe tu problema. Si necesitas hablar con alguien, escribe "persona".`
     );
     return;
   }
 
-  // 3. MANEJAR INFORMACIÓN DE CLIENTE (nombre de tienda/correo)
-  // Si el cliente responde después de pedir estado, asumimos que da su info
-  const lastBotMessage = conversation.messages.slice().reverse().find(m => m.role === 'bot');
-  if (lastBotMessage?.content.includes('nombre de tu supermercado')) {
-    // Aquí conectaríamos con Airtable para buscar el cliente
-    conversation.retryCount = 0;
+  // 4. ESCALAR A PERSONA - SOLO DAR NÚMERO
+  const wantsHuman = ['persona', 'humano', 'agente', 'representante'].some(k => lowerContent.includes(k));
+  
+  if (wantsHuman) {
     await sendWhatsAppMessage(from,
-      `Gracias ${name}. 🔍\n\n` +
-      `Estoy buscando tu información en nuestro sistema...\n\n` +
-      `(Próximamente: integración con Airtable para mostrar estado real)`
+      `Entendido. Te paso el contacto de Johm:\n\n` +
+      `📞 ${JOHM_NUMBER}\n\n` +
+      `Escríbele directamente.`
     );
     return;
   }
 
-  // 4. NO ENTENDÍ → INCREMENTAR CONTADOR Y REINTENTAR
-  conversation.retryCount++;
-  
-  if (conversation.retryCount >= MAX_RETRY_ATTEMPTS) {
-    // Máximo de intentos alcanzado → Escalar
-    await escalateToHuman(from, name, conversation, `No entendí después de ${MAX_RETRY_ATTEMPTS} intentos`);
-  } else {
-    // Reintentar con opciones claras
-    await sendWhatsAppMessage(from,
-      `No estoy segura de entender. 🤔\n\n` +
-      `¿Puedes elegir una opción?\n` +
-      `• Escribe "estado" para ver tu circular\n` +
-      `• Escribe "soporte" para ayuda técnica\n` +
-      `• Escribe "persona" para hablar con alguien`
-    );
-  }
-}
-
-// ============================================
-// ESCALAR A AGENTE HUMANO
-// ============================================
-async function escalateToHuman(customerPhone, customerName, conversation, reason) {
-  conversation.escalated = true;
-  
-  console.log(`🚨 ESCALANDO a humano: ${customerName} (${customerPhone}) - ${reason}`);
-
-  // Notificar al cliente
-  await sendWhatsAppMessage(customerPhone,
-    `Entendido ${customerName}. 👤\n\n` +
-    `Te estoy conectando con un agente humano. Por favor espera un momento...\n\n` +
-    `⏱️ Tiempo estimado: 2-5 minutos`
+  // 5. NO ENTENDÍ
+  await sendWhatsAppMessage(from,
+    `No estoy segura de entender. 🤔\n\n` +
+    `Opciones:\n` +
+    `• "estado" - Ver tu circular\n` +
+    `• "soporte" - Ayuda técnica\n` +
+    `• "persona" - Hablar con Johm`
   );
-
-  // Notificar a Johm (agente humano)
-  const conversationHistory = conversation.messages
-    .map(m => `${m.role === 'user' ? '👤 Cliente' : '🤖 Bot'}: ${m.content}`)
-    .join('\n');
-
-  const notificationMessage = 
-    `🚨 *NUEVO CASO ESCALADO*\n\n` +
-    `*Cliente:* ${customerName}\n` +
-    `*Teléfono:* ${customerPhone}\n` +
-    `*Razón:* ${reason}\n` +
-    `*Hora:* ${new Date().toLocaleString('es-US', { timeZone: 'America/New_York' })} EST\n\n` +
-    `*Historial de conversación:*\n` +
-    `${conversationHistory}\n\n` +
-    `Para responder, escribe:\n` +
-    `\`/responder ${customerPhone} Tu mensaje aquí\``;
-
-  await sendWhatsAppMessage(HUMAN_AGENT_NUMBER, notificationMessage);
-  
-  console.log(`✅ Notificación enviada a ${HUMAN_AGENT_NUMBER}`);
 }
 
 // ============================================
@@ -356,36 +275,7 @@ function handleMessageStatus(status) {
   }
 }
 
-// ============================================
-// ENDPOINT PARA AGENTE HUMANO RESPONDER
-// ============================================
-app.post('/respond', async (req, res) => {
-  const { to, message, agentName = 'Agente' } = req.body;
-  
-  if (!to || !message) {
-    return res.status(400).json({ error: 'Faltan campos: to, message' });
-  }
 
-  console.log(`👤 ${agentName} respondiendo a ${to}: "${message.substring(0, 50)}..."`);
-
-  // Enviar mensaje al cliente
-  await sendWhatsAppMessage(to, 
-    `👤 *${agentName}:*\n\n${message}\n\n` +
-    `¿Hay algo más en lo que pueda ayudarte?`
-  );
-
-  // Actualizar conversación
-  if (conversations.has(to)) {
-    conversations.get(to).messages.push({ 
-      role: 'agent', 
-      content: message, 
-      agent: agentName,
-      timestamp: Date.now() 
-    });
-  }
-
-  res.json({ success: true, message: 'Respuesta enviada' });
-});
 
 // ============================================
 // ENDPOINTS DE SALUD
